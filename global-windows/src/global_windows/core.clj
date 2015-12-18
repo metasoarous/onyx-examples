@@ -26,7 +26,13 @@
 
 (def workflow
   [[:in :identity]
-   [:identity :out]])
+   [:identity :out]
+   [:agg-in :multiply]
+   [:multiply :final-out]
+   ])
+
+(defn multiply [segment]
+  (update-in segment [:n] * 1000))
 
 (def catalog
   [{:onyx/name :in
@@ -40,7 +46,12 @@
    {:onyx/name :identity
     :onyx/fn :clojure.core/identity
     :onyx/type :function
-    :onyx/uniqueness-key :n
+    ;:onyx/uniqueness-key :n
+    :onyx/batch-size batch-size}
+
+   {:onyx/name :multiply
+    :onyx/fn ::multiply
+    :onyx/type :function
     :onyx/batch-size batch-size}
 
    {:onyx/name :out
@@ -55,15 +66,24 @@
 
 (def input-chan (chan capacity))
 
+(def agg-input-chan (chan capacity))
+
 (def output-chan (chan capacity))
 
+(def final-output-chan (chan capacity))
+
 (def input-segments
-  [{:n 0 :event-time #inst "2015-09-13T03:00:00.829-00:00"}
-   {:n 1 :event-time #inst "2015-09-13T03:03:00.829-00:00"}
-   {:n 2 :event-time #inst "2015-09-13T03:07:00.829-00:00"}
-   {:n 3 :event-time #inst "2015-09-13T03:11:00.829-00:00"}
-   {:n 4 :event-time #inst "2015-09-13T03:15:00.829-00:00"}
-   {:n 5 :event-time #inst "2015-09-13T03:02:00.829-00:00"}])
+  [{:n 0 :color :red    :event-time #inst "2015-09-13T03:00:00.829-00:00"}
+   {:n 1 :color :red    :event-time #inst "2015-09-13T03:03:00.829-00:00"}
+   {:n 2 :color :blue   :event-time #inst "2015-09-13T03:07:00.829-00:00"}
+   {:n 3 :color :blue   :event-time #inst "2015-09-13T03:11:00.829-00:00"}
+   {:n 4 :color :blue   :event-time #inst "2015-09-13T03:15:00.829-00:00"}
+   {:n 5 :color :orange :event-time #inst "2015-09-13T03:02:00.829-00:00"}
+   {:n 6 :color :blue   :event-time #inst "2015-09-13T03:08:00.829-00:00"}
+   {:n 7 :color :blue   :event-time #inst "2015-09-13T03:14:00.829-00:00"}
+   {:n 8 :color :blue   :event-time #inst "2015-09-13T03:15:00.829-00:00"}
+   {:n 9 :color :orange :event-time #inst "2015-09-13T03:32:00.829-00:00"}
+   ])
 
 (doseq [segment input-segments]
   (>!! input-chan segment))
@@ -79,42 +99,91 @@
 (defn inject-in-ch [event lifecycle]
   {:core.async/chan input-chan})
 
+(defn inject-agg-in-ch [event lifecycle]
+  {:core.async/chan agg-input-chan})
+
 (defn inject-out-ch [event lifecycle]
   {:core.async/chan output-chan})
+
+(defn inject-final-out-ch [event lifecycle]
+  {:core.async/chan final-output-chan})
 
 (def in-calls
   {:lifecycle/before-task-start inject-in-ch})
 
+(def agg-in-calls
+  {:lifecycle/before-task-start inject-agg-in-ch})
+
 (def out-calls
   {:lifecycle/before-task-start inject-out-ch})
 
+(def final-out-calls
+  {:lifecycle/before-task-start inject-final-out-ch})
+
 (def lifecycles
-  [{:lifecycle/task :in
+  [
+   {:lifecycle/task :in
     :lifecycle/calls ::in-calls}
    {:lifecycle/task :in
     :lifecycle/calls :onyx.plugin.core-async/reader-calls}
    {:lifecycle/task :out
     :lifecycle/calls ::out-calls}
    {:lifecycle/task :out
-    :lifecycle/calls :onyx.plugin.core-async/writer-calls}])
+    :lifecycle/calls :onyx.plugin.core-async/writer-calls}
+   {:lifecycle/task :agg-in
+    :lifecycle/calls ::agg-in-calls}
+   {:lifecycle/task :agg-in
+    :lifecycle/calls :onyx.plugin.core-async/reader-calls}
+   {:lifecycle/task :final-out
+    :lifecycle/calls ::final-out-calls}
+   {:lifecycle/task :final-out
+    :lifecycle/calls :onyx.plugin.core-async/writer-calls}
+   ])
+
+(def sum
+  {:aggregation/init               (fn [window] {})
+   :aggregation/fn                 (fn [state window segment]
+                                     (let [k (second (:window/aggregation window))
+                                           level (:onyx/group-by-key window)]
+                                       [:set-value (update-in state
+                                                              [(get segment level)]
+                                                              (fn [current-value]
+                                                                (+ (or current-value 0)
+                                                                   (get segment k))))]))
+   :aggregation/apply-state-update (fn [state [changelog-type value]]
+                                     (case changelog-type
+                                       :set-value value))})
 
 (def windows
   [{:window/id :collect-segments
     :window/task :identity
     :window/type :global
-    :window/aggregation :onyx.windowing.aggregation/conj
-    :window/window-key :event-time}])
+    :onyx/group-by-key :color
+    :window/aggregation ::sum
+    :window/window-key :event-time
+    }])
+
+(defn done? [event window-id lower upper segment]
+  (= :done segment))
 
 (def triggers
   [{:trigger/window-id :collect-segments
     :trigger/refinement :accumulating
-    :trigger/on :segment
-    :trigger/threshold [5 :elements]
-    :trigger/sync ::dump-window!}])
+    :trigger/on :punctuation
+    :trigger/pred ::done?
+    ;:trigger/threshold [5 :elements]
+    :trigger/sync ::queue-aggregates!}
+   ])
 
 (defn dump-window! [event window-id lower-bound upper-bound state]
   (println (format "Window extent %s, [%s - %s] contents: %s"
                    window-id lower-bound upper-bound state)))
+
+(defn queue-aggregates! [event window-id lower-bound upper-bound state]
+  (doseq [[k v] state]
+    (>!! agg-input-chan {:color k :n v}))
+  (>!! agg-input-chan :done)
+  (close! agg-input-chan))
 
 (onyx.api/submit-job
  peer-config
@@ -133,6 +202,9 @@
 (close! input-chan)
 
 (def results (take-segments! output-chan))
+(clojure.pprint/pprint "output-chan results:" results)
+(def final-results (take-segments! final-output-chan))
+(clojure.pprint/pprint "final-output-chan results:" final-results)
 
 (doseq [v-peer v-peers]
   (onyx.api/shutdown-peer v-peer))
